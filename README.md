@@ -9,7 +9,8 @@
 
 - 已验证：**Redmi Note 12 Turbo（marble）/ NXP SN110T / Android 15 / KernelSU + Zygisk Next**
 - 未验证：其它 NXP 机型、其它 ROM
-- 不支持：ST54L 机型（如小米 15 Pro）——它们的 ST HAL 没有轮询配置接口，见「兼容性」
+- 不支持：**小米 15 Pro（haotian，ST54L）**——其 ST HAL 缺少厂商命令引擎（`stpropnci`），
+  且实测无法通过替换 HAL/固件/服务二进制移植；小米 17（pudding）原生支持。对比数据与移植清单见 [§10](#10-小米-15-prost54l移植评估)。
 
 ---
 
@@ -230,11 +231,131 @@ activate RX-PATCH [3] 01 02 04 00 ...
 | --- | --- | --- |
 | Redmi Note 12 Turbo (marble) | NXP SN110T | ✅ 真机验证可刷图 |
 | 其它 NXP SN100/SN220 机型 | NXP | ⚠️ 理论可行，需自行确认库名/符号 |
-| 小米 15 Pro (haotian) | ST54L | ❌ ST HAL 无轮询配置接口（`oid=1 0x15/0x13` 返回 `150B/1305`） |
+| 小米 17 (pudding) | ST54L | ✅ 原厂即支持（`stpropnci` HAL + 新固件），无需本模块 |
+| 小米 15 Pro (haotian, Android 16) | ST54L | ❌ HAL 无厂商命令引擎，`oid=1 0x15/0x13` 返回 `150B/1305` |
+| 小米 15 Pro (haotian, OS4.0 / Android 17) | ST54L | ❌ HAL 与 OS3 基本相同，刷系统也不会改善 |
+
+> 小米 15 Pro 的完整对比、移植尝试与缺失依赖见 [§10](#10-小米-15-prost54l移植评估)。
 
 ---
 
-## 10. 卸载
+## 10. 小米 15 Pro（ST54L）移植评估
+
+**结论：文件级移植不可行，不建议投入。** 下面是实测数据与原因，供后来者参考。
+
+### 10.1 调用链
+
+```
+NfcService (com.android.nfc)
+  └─ sendVendorNciMessage(gid=0x0F, oid=1, [subcmd, ...])
+       └─ HIDL android.hardware.nfc@1.2
+            └─ /odm/bin/hw/android.hardware.nfc-service-st   ← init 启动的 vendor 服务
+                 └─ dlopen /odm/lib64/nfc_nci.st21nfc.st.so  ← ST HAL
+                      └─ /dev/st21nfc (I2C) → CLF 固件 /odm/firmware/st54l_fw.bin
+```
+
+`0x13/0x15` 这类厂商命令由 HAL 的 `stpropnci_*` 引擎处理后再下发给 CLF；15 Pro 的 HAL
+**没有**这套引擎，命令直接得到 `0x0B`（不支持），换固件也不会出现。
+
+### 10.2 固件对比（实取数据）
+
+| | haotian OS3.0 (Android 16) | haotian OS4.0.0.19 (Android 17) | pudding OS4.0.0.32 (Android 17) | pudding OS3.0.319.0 (Android 16) |
+| --- | --- | --- | --- | --- |
+| `nfc_nci.st21nfc.st.so` | 200,560 B | 200,560 B | 283,656 B | 267,048 B |
+| 导出符号数 | 343 | 345 | 449 | — |
+| `stpropnci_*` 引擎 | ❌ 无 | ❌ 无 | ✅ 30 个符号 | ✅ 30 个符号 |
+| `st54l_fw.bin` | 250,917 B | 未取到 | 260,157 B | 260,157 B |
+| 固件 SHA-256 | `15da4aa9…` | — | `22a9e85d…` | `22a9e85d…`（与 OS4 相同） |
+| `libnfc-hal-st.conf` | 6,282 B | 6,282 B（与 OS3 逐字节相同） | 7,177 B | 7,177 B |
+| `nfc-service-st` | 86,376 B | 未取到 | 86,400 B | 86,400 B |
+
+关键结论：
+
+1. **OS4 对 15 Pro 没有意义**：haotian 的 OS4 HAL 与 OS3 只有 2 个符号差异
+   （`mParamReset`、`property_get`），字符串仅删了几句 `clear/reset FW download status`，
+   同样没有 `stpropnci`。
+2. **小米 17 的差别是整套的**：HAL 换了实现（+106 KB）、固件换了版本（+9.2 KB）、
+   配置与 service 二进制也不同。它出厂就支持墨水屏壳。
+
+### 10.3 子命令实测（15 Pro，Android 16，暂停轮询后）
+
+`NfcAdapter.sendVendorNciMessage(1, 15, 1, payload)`，payload 为单字节子命令：
+
+| 子命令 | 响应 | 含义 |
+| --- | --- | --- |
+| `0x02` | `0200 0603 0204 1188 03020100 44507000` | 读取配置/版本信息，可用 |
+| `0x03` | `03000186` | 可用 |
+| `0x10` / `0x11` / `0x12` | `…00` | 接受 |
+| `0x13` | `1302` / `1305` | 存在，但参数/状态被拒 |
+| `0x15` | `150B` | **不支持**（ink-nfc-lab 用它读轮询帧） |
+| `0x14` / `0x16`–`0x1F` | `…0B` | 不支持 |
+
+尝试用 `Protocol.polling7A()` 的原始字节 `01 2A 02 0A 7A` 作为 `0x13` 参数：
+
+```
+1300                    → 1305
+13012A020A7A            → 1305
+13012A020A7A00          → 1305
+13012A020A7A0000        → 1305
+13012A020A7A10          → 1305
+```
+
+即 `0x13` 存在但 HAL/CLF 不接受这组轮询帧参数——这条路在 15 Pro 上走不通。
+
+### 10.4 移植尝试与结果
+
+三次都通过 KSU 模块 + `mount --bind` 覆盖 `/odm`，改完 `kill` 掉 HAL 让 init 重启：
+
+| # | 覆盖内容 | 结果 |
+| --- | --- | --- |
+| 1 | pudding OS4 HAL + fw + conf | `init.svc.nfc_hal_service = restarting`，无 tombstone |
+| 2 | pudding OS3（同为 Android 16）HAL + fw + conf | 同样 `restarting` |
+| 3 | pudding OS3 service 二进制 + HAL + fw + conf | 仍然 `restarting` |
+
+回滚方式（立即生效，不用重启）：
+
+```sh
+umount /odm/bin/hw/android.hardware.nfc-service-st
+umount /odm/lib64/nfc_nci.st21nfc.st.so
+umount /odm/firmware/st54l_fw.bin
+umount /odm/etc/libnfc-hal-st.conf
+setprop ctl.restart nfc_hal_service
+```
+
+回滚后 `dumpsys nfc` 应恢复 `mState=on`，HAL 进程正常。
+
+> 注意：`/data` 为 f2fs + `inline_data`/压缩的机型，`losetup` + `mount -t erofs` 可能
+> 报 `I/O error`；先 `setenforce 0` 并手动 `mknod` 出正确 minor 的 loop 节点
+> （该内核 minor = 序号 × 8）可绕过。仅用于解包，别长期保持 permissive。
+
+### 10.5 还缺什么（移植一整套 vendor 子系统的清单）
+
+| 层 | 需要的组件 | 状态 |
+| --- | --- | --- |
+| `/odm/bin/hw` | `android.hardware.nfc-service-st` | ✅ 已取到并替换，仍失败 |
+| `/odm/lib64` | `nfc_nci.st21nfc.st.so`（`stpropnci` 版） | ✅ 已取到并替换 |
+| `/odm/firmware` | `st54l_fw.bin`（260,157 B） | ✅ 已取到并替换 |
+| `/odm/etc` | `libnfc-hal-st.conf`、`st54l_conf.txt` | ✅ 已替换 |
+| `/vendor/lib64` | `libstnfc-auth.so`、`libstnfc-streset.so` 等 ST 私有库 | ⚠️ 两机版本不同，未替换 |
+| init rc | `/odm/etc/init/*nfc*.rc`（user/group/capabilities/seclabel） | ⚠️ 可能不同 |
+| 属性 | `ro.hardware.nfc`、`ro.vendor.*`、机型校验 | ⚠️ HAL 可能校验 |
+| 框架 | `NfcService`/`NfcNci` + `com.st.android.nfc_extensions_16` | ⚠️ QTag 接口可能在这层 |
+| SELinux | `hal_nfc_default_exec`、`vendor_file`、`vendor_configs_file` | ✅ 已按原标签设置 |
+| 内核/驱动 | `/dev/st21nfc`、I2C 时序、CLF 接口 | ⚠️ 同 ST54L，理论上兼容 |
+
+即使把 `⚠️` 全部补齐，也要处理 HAL 启动崩溃、eSE/公交卡/门禁回归、开机稳定性；
+**最坏情况是 NFC 与安全元件一起不可用**，且这种 vendor 层改动不能靠“删模块”完全回滚。
+
+### 10.6 建议
+
+- 需要驱动墨水屏壳：用 **NXP SN110T 机型（如 marble）** + 本项目模块，已验证；
+- 小米 15 Pro：等 OEM 在后续版本换成 17 同款 ST HAL（OS4.0.0.19 尚未换），
+  或另找一台可随意刷机的 15 Pro 做实验机再尝试整包移植；
+- 不要在主力的 15 Pro 上做 vendor 层替换。
+
+---
+
+## 11. 卸载
 
 KernelSU/Magisk 里禁用或卸载模块，然后重启。overlay 消失后系统即恢复原厂 NFC 行为。
 
@@ -246,7 +367,7 @@ adb shell su -c 'rm -rf /data/adb/modules/nfc-qpoll && reboot'
 
 ---
 
-## 11. 许可与致谢
+## 12. 许可与致谢
 
 - 本项目代码（`jni/module.cpp`、`gadget/hook.js`、脚本）：MIT，见 `LICENSE`
 - `jni/zygisk.hpp`：Copyright 2022-2023 John "topjohnwu" Wu，ISC 风格许可，见文件头与 `NOTICE.md`
