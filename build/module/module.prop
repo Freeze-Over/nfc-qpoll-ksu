@@ -1,0 +1,6 @@
+id=nfc-qpoll
+name=NFC Q-Poll (Zygisk)
+version=1.0
+versionCode=1
+author=dsh
+description=Q-Poll 0x71 bridge for Huawei e-ink case: Zygisk + Frida Gadget injected into com.android.nfc

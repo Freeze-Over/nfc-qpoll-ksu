@@ -1,0 +1,6 @@
+{
+  "interaction": {
+    "type": "script",
+    "path": "/system/lib64/nfcq-hook.js"
+  }
+}
