@@ -1,0 +1,9 @@
+# build outputs
+build/
+
+# downloaded at build time (LGPL, not part of this repo)
+gadget/libgadget.so
+
+# tooling
+.vscode/
+*.log
